@@ -7,6 +7,7 @@
 #include "console.hpp"
 #include "vars.hpp"
 #include "backend_server.hpp"
+#include "resource_sync_fix.hpp"
 
 #include <utils/string.hpp>
 #include <utils/hook.hpp>
@@ -470,6 +471,7 @@ namespace backend_server
 		utils::hook::detour http_codec_end_decode_hook;
 
 		vars::var_ptr var_server_logging;
+		vars::var_ptr var_resource_sync_fix;
 		vars::var_ptr var_net_server_heartbeat;
 
 		std::string get_dump_path(const std::string cmd_name, const bool request)
@@ -519,8 +521,58 @@ namespace backend_server
 			return res;
 		}
 
+		std::atomic_bool resource_sync_fix_running{false};
+
+		void try_fix_resource_sync(game::fox::Buffer* buffer)
+		{
+			if (var_resource_sync_fix == nullptr || !var_resource_sync_fix->current.enabled() || !is_using_custom_server())
+			{
+				return;
+			}
+
+			try
+			{
+				const auto data = get_fox_buffer(buffer);
+				if (data.find("CMD_SYNC_RESOURCE") == std::string::npos)
+				{
+					return;
+				}
+
+				// our own probe requests never go through the game's codec, but be safe against re-entry
+				if (resource_sync_fix_running.exchange(true))
+				{
+					return;
+				}
+
+				const auto request = nlohmann::json::parse(data);
+
+				std::string info;
+				const auto result = resource_sync_fix::repair(request, [](const nlohmann::json& message)
+				{
+					return send_command("WEB", message, true);
+				}, &info);
+
+				if (result == resource_sync_fix::result::repaired)
+				{
+					console::info("[resource fix] %s\n", info.data());
+				}
+				else if (result == resource_sync_fix::result::failed)
+				{
+					console::warn("[resource fix] %s\n", info.data());
+				}
+			}
+			catch (const std::exception& e)
+			{
+				console::warn("[resource fix] error: %s\n", e.what());
+			}
+
+			resource_sync_fix_running = false;
+		}
+
 		void* http_codec_begin_encode_stub(void* this_, void* ctx, game::fox::Buffer* buffer, void* session_key)
 		{
+			try_fix_resource_sync(buffer);
+
 			if (var_server_logging->current.enabled())
 			{
 				const auto data = get_fox_buffer(buffer);
@@ -638,6 +690,7 @@ namespace backend_server
 			var_net_proxy_url = vars::register_string("net_proxy_url", "", vars::var_flag_saved, "proxy url for backend server (example: http://1.2.3.4:1234 empty = disabled)");
 		
 			var_server_logging = vars::register_bool("net_server_logging", false, vars::var_flag_saved, "enable server logging");
+			var_resource_sync_fix = vars::register_bool("net_resource_sync_fix", true, vars::var_flag_saved, "realign resource sync versions with the server before each resource sync (fixes resources reverting)");
 			var_net_server_heartbeat = vars::register_int("net_server_heartbeat", 0, 0, 10000, 0, "backend server heartbeat interval");
 		}
 
